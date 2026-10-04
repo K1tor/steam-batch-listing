@@ -7,6 +7,50 @@
   const SELL_URL = "https://steamcommunity.com/market/sellitem/";
   const SYMBOLS = { 1: "$", 2: "£", 3: "€", 5: "₽", 7: "R$", 23: "¥" };
 
+  /* 分类:用 Steam 物品标签的内部名自动归类 */
+  const CAT_LABELS = {
+    weapon: "枪械皮肤", knife: "刀具", gloves: "手套", case: "箱子/容器",
+    sticker: "贴纸", key: "钥匙", music: "音乐盒", graffiti: "涂鸦",
+    patch: "布章", agent: "特工", charm: "挂件", card: "卡牌",
+    booster: "补充包", background: "资料背景", emoticon: "表情",
+    community: "社区物品", other: "其他",
+  };
+
+  function classify(d) {
+    const tags = d.tags || [];
+    const type = tags.find((t) => t.category === "Type");
+    if (type) {
+      const n = d.market_hash_name || d.name || "";
+      switch (type.internal_name) {
+        case "Type_Knife": return "knife";
+        case "Type_Gloves": return "gloves";
+        case "Type_Container": return "case";
+        case "Type_Sticker": return "sticker";
+        case "Type_Key": return "key";
+        case "Type_MusicKit": return "music";
+        case "Type_Graffiti": return "graffiti";
+        case "Type_Patch": return "patch";
+        case "Type_Agent": return "agent";
+        case "Type_Charm": return "charm";
+        case "Type_Weapon": return n.startsWith("★") ? "knife" : "weapon";
+        default: return "other";
+      }
+    }
+    const ic = tags.find((t) => t.category === "item_class");
+    if (ic) {
+      const m = {
+        item_class_2: "card", item_class_5: "card", item_class_3: "booster",
+        item_class_1: "background", item_class_4: "emoticon",
+      };
+      return m[ic.internal_name] || "community";
+    }
+    const n = (d.market_hash_name || d.name || "").toLowerCase();
+    if (/trading card|交换卡片|foil card/.test(n)) return "card";
+    if (/case|capsule|package|胶囊|武器箱/.test(n)) return "case";
+    if (/sticker|贴纸/.test(n)) return "sticker";
+    return "other";
+  }
+
   const state = {
     multiMode: false,
     selected: new Map(), // assetid -> { appid, contextid, assetid }
@@ -16,6 +60,9 @@
     armTimer: 0,
     pageSteamId: null,
     currency: "",
+    catFilter: null, // 当前分类,null = 全部
+    currentInvKey: null, // "appid_ctx" -> invCache 键
+    invCache: new Map(), // "appid_ctx" -> Map(assetid -> { name, marketable, cat })
     settings: { strategy: "market", fixedPrice: "", offset: "0", delay: "800" },
   };
 
@@ -87,11 +134,16 @@
   }
 
   function applyMarks() {
+    const inv = state.currentInvKey ? state.invCache.get(state.currentInvKey) : null;
     for (const el of getItemElements()) {
       const assetid = el.id.split("_")[2];
       const on = state.selected.has(assetid);
       if (on !== el.classList.contains("sbl-item-selected"))
         el.classList.toggle("sbl-item-selected", on);
+      // 分类过滤:不在当前分类的物品置灰(仅在分类数据已加载时)
+      const info = inv && inv.get(assetid);
+      const dim = !!(state.catFilter && info && info.cat !== state.catFilter);
+      if (dim !== el.classList.contains("sbl-dim")) el.classList.toggle("sbl-dim", dim);
     }
   }
 
@@ -131,7 +183,85 @@
       scanTimer = setTimeout(applyMarks, 250);
     });
     mo.observe(document.body, { childList: true, subtree: true });
-    window.addEventListener("hashchange", () => setTimeout(applyMarks, 300));
+    window.addEventListener("hashchange", () =>
+      setTimeout(() => {
+        // 切换游戏/库存后:清空分类过滤并重新加载分类数据
+        state.catFilter = null;
+        state.currentInvKey = null;
+        renderCats(null);
+        applyMarks();
+        if (state.multiMode) ensureInv();
+      }, 300)
+    );
+  }
+
+  /* ---------------- 分类数据 ---------------- */
+
+  function currentAppCtx() {
+    const el = getItemElements()[0];
+    if (el) {
+      const m = el.id.match(ITEM_ID_RE);
+      return m[1] + "_" + m[2];
+    }
+    const hm = (location.hash || "").match(/^#(\d+)_(\d+)/);
+    return hm ? hm[1] + "_" + hm[2] : null;
+  }
+
+  async function ensureInv() {
+    const key = currentAppCtx();
+    if (!key) return null;
+    if (state.invCache.has(key)) {
+      state.currentInvKey = key;
+      renderCats(key);
+      applyMarks();
+      return state.invCache.get(key);
+    }
+    const own = await getOwnSteamId();
+    if (!own) {
+      logLine("warn", "未检测到登录状态,无法加载分类");
+      return null;
+    }
+    logLine("dim", "正在获取分类信息…");
+    try {
+      const [appid, ctx] = key.split("_");
+      const inv = await fetchInventory(own, appid, ctx);
+      state.invCache.set(key, inv);
+      state.currentInvKey = key;
+      renderCats(key);
+      applyMarks();
+      return inv;
+    } catch (e) {
+      logLine("err", "获取分类失败: " + e.message);
+      return null;
+    }
+  }
+
+  function renderCats(key) {
+    state.currentInvKey = key || null;
+    if (!ui.catRow) return;
+    const inv = key ? state.invCache.get(key) : null;
+    if (!inv) {
+      ui.catRow.innerHTML = '<span class="tip">分类:开启多选后自动加载</span>';
+      return;
+    }
+    const counts = {};
+    let total = 0;
+    for (const info of inv.values()) {
+      counts[info.cat] = (counts[info.cat] || 0) + 1;
+      total++;
+    }
+    const chips = [
+      `<button class="cat ${!state.catFilter ? "on" : ""}" data-cat="all">全部 ${total}</button>`,
+    ];
+    Object.keys(counts)
+      .sort((a, b) => counts[b] - counts[a])
+      .forEach((c) => {
+        const label = CAT_LABELS[c] || c;
+        chips.push(
+          `<button class="cat ${state.catFilter === c ? "on" : ""}" data-cat="${c}">${label} ${counts[c]}</button>`
+        );
+      });
+    ui.catRow.innerHTML = chips.join("");
   }
 
   /* ---------------- Steam 接口 ---------------- */
@@ -156,6 +286,7 @@
           map.set(a.assetid, {
             name: d.market_hash_name || d.name || a.assetid,
             marketable: d.marketable === 1,
+            cat: classify(d),
           });
       }
       if (!assets.length) break;
@@ -426,8 +557,10 @@
     '<div class="row">' +
     '<button class="btn" id="multiBtn">开启多选</button>' +
     '<button class="btn" id="pageAll">全选本页</button>' +
+    '<button class="btn" id="catAll">全选本类</button>' +
     '<button class="btn ghost" id="clearSel">清空</button>' +
     "</div>" +
+    '<div class="cats" id="catRow"><span class="tip">分类:开启多选后自动加载</span></div>' +
     '<div class="row">' +
     '<span class="lbl">定价</span>' +
     '<select id="strategy">' +
@@ -480,6 +613,11 @@
     .row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     .lbl { width: 42px; color: #8f98a0; flex: none; }
     .tip { color: #7c8791; font-size: 11px; }
+    .cats { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+    .cat { background: #1d2733; border: 1px solid #3c4653; color: #c7d5e0;
+           font-size: 11px; padding: 2px 8px; border-radius: 10px; cursor: pointer; }
+    .cat:hover { border-color: #66c0f4; }
+    .cat.on { background: #31648c; border-color: #66c0f4; color: #fff; }
     select, input { background: #10161d; color: #c7d5e0; border: 1px solid #3c4653;
                     border-radius: 4px; padding: 4px 7px; outline: none; }
     select:focus, input:focus { border-color: #66c0f4; }
@@ -528,6 +666,8 @@
     ui.body = q("body");
     ui.multiBtn = q("multiBtn");
     ui.pageAll = q("pageAll");
+    ui.catAll = q("catAll");
+    ui.catRow = q("catRow");
     ui.clearSel = q("clearSel");
     ui.strategy = q("strategy");
     ui.rowFixed = q("rowFixed");
@@ -548,15 +688,30 @@
       ui.multiBtn.textContent = state.multiMode ? "多选中(点选物品)" : "开启多选";
       ui.multiBtn.classList.toggle("on", state.multiMode);
       document.body.classList.toggle("sbl-multimode", state.multiMode);
+      if (state.multiMode && !state.currentInvKey) ensureInv();
     });
 
-    // 全选本页可见物品
+    // 分类芯片
+    ui.catRow.addEventListener("click", (e) => {
+      const b = e.target.closest("button.cat");
+      if (!b || state.running) return;
+      state.catFilter = b.dataset.cat === "all" ? null : b.dataset.cat;
+      renderCats(state.currentInvKey);
+      applyMarks();
+    });
+
+    // 全选本页可见物品(分类过滤生效时只选当前分类)
     ui.pageAll.addEventListener("click", () => {
+      const inv = state.currentInvKey ? state.invCache.get(state.currentInvKey) : null;
       let added = 0;
       for (const el of getItemElements()) {
         if (el.offsetParent === null) continue; // 跳过隐藏分页
         const m = el.id.match(ITEM_ID_RE);
         const assetid = m[3];
+        if (state.catFilter) {
+          const info = inv && inv.get(assetid);
+          if (!info || info.cat !== state.catFilter) continue;
+        }
         if (!state.selected.has(assetid)) {
           state.selected.set(assetid, { appid: m[1], contextid: m[2], assetid });
           added++;
@@ -565,6 +720,38 @@
       applyMarks();
       updateCount();
       logLine("dim", "本页新增选择 " + added + " 件,共 " + state.selected.size + " 件");
+    });
+
+    // 全选当前分类(整个库存 DOM 范围内)
+    ui.catAll.addEventListener("click", async () => {
+      if (state.running) return;
+      if (!state.catFilter) {
+        logLine("warn", "先在分类里点选一个分类,再点「全选本类」");
+        return;
+      }
+      if (!state.currentInvKey) {
+        const inv = await ensureInv();
+        if (!inv) {
+          logLine("err", "无法获取库存分类信息");
+          return;
+        }
+      }
+      const inv = state.invCache.get(state.currentInvKey);
+      let added = 0;
+      for (const el of getItemElements()) {
+        const m = el.id.match(ITEM_ID_RE);
+        if (!m) continue;
+        const assetid = m[3];
+        const info = inv && inv.get(assetid);
+        if (!info || info.cat !== state.catFilter) continue;
+        if (!state.selected.has(assetid)) {
+          state.selected.set(assetid, { appid: m[1], contextid: m[2], assetid });
+          added++;
+        }
+      }
+      applyMarks();
+      updateCount();
+      logLine("dim", "按分类新增选择 " + added + " 件,共 " + state.selected.size + " 件");
     });
 
     ui.clearSel.addEventListener("click", () => {
@@ -644,7 +831,7 @@
   }
 
   function setBusy(busy) {
-    for (const el of [ui.multiBtn, ui.pageAll, ui.clearSel, ui.strategy, ui.fixedPrice, ui.offset, ui.delay, ui.startBtn])
+    for (const el of [ui.multiBtn, ui.pageAll, ui.catAll, ui.catRow, ui.clearSel, ui.strategy, ui.fixedPrice, ui.offset, ui.delay, ui.startBtn])
       el.disabled = busy;
     ui.stopBtn.disabled = !busy;
   }

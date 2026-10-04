@@ -12,3 +12,7 @@ body.sbl-multimode .item {
   opacity: 0.3 !important;
   filter: grayscale(1);
 }
+
+.sbl-dim {
+  opacity: 0.35;
+}
